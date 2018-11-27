@@ -188,6 +188,9 @@ class Shard(utils.SaveLoad):
         return self.get_index().index[pos]
 
     def __getitem__(self, query):
+        return self.query_filtered(query, None)
+
+    def query_filtered(self, query, mask):
         """Get similarities of document (or corpus) `query` to all documents in the corpus.
 
         Parameters
@@ -209,7 +212,7 @@ class Shard(utils.SaveLoad):
             index.normalize = self.normalize
         except Exception:
             raise ValueError("num_best and normalize have to be set before querying a proxy Shard object")
-        return index[query]
+        return index.query_filtered(query, mask)
 
 
 def query_shard(args):
@@ -226,9 +229,9 @@ def query_shard(args):
         Similarities of the query against documents indexed in this shard.
 
     """
-    query, shard = args  # simulate starmap (not part of multiprocessing in older Pythons)
+    query, shard, mask = args  # simulate starmap (not part of multiprocessing in older Pythons)
     logger.debug("querying shard %s num_best=%s in process %s", shard, shard.num_best, os.getpid())
-    result = shard[query]
+    result = shard.query_filtered(query, mask)
     logger.debug("finished querying shard %s in process %s", shard, os.getpid())
     return result
 
@@ -453,7 +456,7 @@ class Similarity(interfaces.SimilarityABC):
         del self.shards[-1]  # remove the shard from index, *but its file on disk is not deleted*
         logger.debug("reopen complete")
 
-    def query_shards(self, query):
+    def query_shards(self, query, mask):
         """Apply shard[query] to each shard in `self.shards`. Used internally.
 
         Parameters
@@ -467,11 +470,20 @@ class Similarity(interfaces.SimilarityABC):
             Query results.
 
         """
-        args = zip([query] * len(self.shards), self.shards)
+
+        if mask is not None:
+            offsets = numpy.cumsum([len(shard) for shard in self.shards])
+            # logger.info("offsets: %s", offsets)
+            shard_masks = numpy.split(mask, offsets[:-1])
+            # logger.info("masks: %s", shard_masks)
+        else:
+            shard_masks = [None for shard in self.shards]
+
+        args = zip([query] * len(self.shards), self.shards, shard_masks)
         if PARALLEL_SHARDS and PARALLEL_SHARDS > 1:
             logger.debug("spawning %i query processes", PARALLEL_SHARDS)
             pool = multiprocessing.Pool(PARALLEL_SHARDS)
-            result = pool.imap(query_shard, args, chunksize=1 + len(self.shards) / PARALLEL_SHARDS)
+            result = pool.imap(query_shard, args, chunksize=1 + int(len(list(args)) / PARALLEL_SHARDS))
         else:
             # serial processing, one shard after another
             pool = None
@@ -479,6 +491,10 @@ class Similarity(interfaces.SimilarityABC):
         return pool, result
 
     def __getitem__(self, query):
+        # logger.warning("using empty mask")
+        return self.query_filtered(query, None)
+
+    def query_filtered(self, query, indices):
         """Get similarities of the document (or corpus) `query` to all documents in the corpus.
 
         Parameters
@@ -517,11 +533,22 @@ class Similarity(interfaces.SimilarityABC):
             shard.num_best = self.num_best
             shard.normalize = self.norm
 
+        if indices is not None:
+            # logger.info("INDICES is %s (%s)", type(indices), indices)
+            # logger.info("LEN SELF IS %d", len(self))
+            mask = numpy.zeros(len(self), dtype=bool)
+            # logger.info("SHAPE OF MASK: %s", mask.shape)
+            mask[indices] = True
+            # logger.info("QUERY IS TYPE %s", type(query))
+            # logger.info("MASK IS TYPE %s (%s)", type(mask), mask.dtype)
+        else:
+            mask = None
+
         # there are 4 distinct code paths, depending on whether input `query` is
         # a corpus (or numpy/scipy matrix) or a single document, and whether the
         # similarity result should be a full array or only num_best most similar
         # documents.
-        pool, shard_results = self.query_shards(query)
+        pool, shard_results = self.query_shards(query, mask)
         if self.num_best is None:
             # user asked for all documents => just stack the sub-results into a single matrix
             # (works for both corpus / single doc query)
@@ -529,10 +556,18 @@ class Similarity(interfaces.SimilarityABC):
         else:
             # the following uses a lot of lazy evaluation and (optionally) parallel
             # processing, to improve query latency and minimize memory footprint.
-            offsets = numpy.cumsum([0] + [len(shard) for shard in self.shards])
+            if mask is not None:
+                offsets = numpy.cumsum([len(shard) for shard in self.shards])
+                shard_masks = numpy.split(mask, offsets[:-1])
+                offsets = numpy.cumsum([0] + [shard_mask.sum() for shard_mask in shard_masks])
+            else:
+                offsets = numpy.cumsum([0] + [len(shard) for shard in self.shards])
 
             def convert(shard_no, doc):
-                return [(doc_index + offsets[shard_no], sim) for doc_index, sim in doc]
+                if mask is None:
+                    return [(doc_index + offsets[shard_no], sim) for doc_index, sim in doc]
+                else:
+                    return [(indices[doc_index + offsets[shard_no]], sim) for doc_index, sim in doc]
 
             is_corpus, query = utils.is_corpus(query)
             is_corpus = is_corpus or hasattr(query, 'ndim') and query.ndim > 1 and query.shape[0] > 1
@@ -1170,7 +1205,7 @@ class SparseMatrixSimilarity(interfaces.SimilarityABC):
         """Get size of index."""
         return self.index.shape[0]
 
-    def get_similarities(self, query):
+    def get_similarities(self, query, mask):
         """Get similarity between `query` and this index.
 
         Warnings
@@ -1215,4 +1250,9 @@ class SparseMatrixSimilarity(interfaces.SimilarityABC):
         else:
             # otherwise, return a 2d matrix (#queries x #index)
             result = result.toarray().T
+        if mask is not None:
+            logger.info("SHAPE OF RESULT: %s", result.shape)
+            logger.info("SHAPE OF MASK: %s", mask.shape)
+            result = result[:, mask]
+            logger.info("SHAPE OF RESULT AFTER MASKING: %s", result.shape)
         return result

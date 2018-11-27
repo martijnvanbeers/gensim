@@ -306,6 +306,9 @@ class SimilarityABC(utils.SaveLoad):
         raise NotImplementedError("cannot instantiate Abstract Base Class")
 
     def __getitem__(self, query):
+        return self.query_filtered(query, None)
+
+    def query_filtered(self, query, mask):
         """Get similarities of the given document or corpus against this index.
 
         Uses :meth:`~gensim.interfaces.SimilarityABC.get_similarities` internally.
@@ -337,7 +340,7 @@ class SimilarityABC(utils.SaveLoad):
                     query = [matutils.unitvec(v) for v in query]
                 else:
                     query = matutils.unitvec(query)
-        result = self.get_similarities(query)
+        result = self.get_similarities(query, mask)
 
         if self.num_best is None:
             return result
